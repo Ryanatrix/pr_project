@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.linalg import solve_triangular
+from scipy.special import logsumexp
+from sklearn.mixture import GaussianMixture
 
 from .data_io import load_patient
 
@@ -34,64 +36,121 @@ DEFAULT_REGIONS = {"whole": (1, 2, 3, 4), "core": (1, 3, 4), "enhancing": (4,)}
 # ----------------------------------------------------------------------------
 # preprocessing at volume level and parameter fitting
 # ----------------------------------------------------------------------------
-def normalise_volume(vol: np.ndarray):
-    """z-score each modality over the whole 3D brain (voxels > 0 in any modality).
+def normalise_volume(vol: np.ndarray, method: str = "zscore"):
+    """Normalise each modality over the whole 3D brain (voxels > 0 in any modality).
+
+    method = "zscore": (v - mean) / std
+    method = "robust": (v - median) / (1.4826 * MAD)   (less pulled by a large tumour)
 
     Normalising per VOLUME (not per slice) keeps intensities comparable between slices and
-    between patients, which is what makes class Gaussians fitted on other patients usable.
+    between patients, which is what makes class models fitted on other patients usable.
     Returns (vol_normalised float32, brain 3D bool); voxels outside the brain are set to 0.
     """
     brain = (vol > 0).any(axis=-1)
     out = np.zeros_like(vol, dtype=np.float32)
     for c in range(vol.shape[-1]):
         v = vol[..., c][brain]
-        sd = float(v.std())
-        out[..., c][brain] = (v - v.mean()) / (sd if sd > 0 else 1.0)
+        if method == "zscore":
+            loc, scale = float(v.mean()), float(v.std())
+        elif method == "robust":
+            loc = float(np.median(v))
+            scale = 1.4826 * float(np.median(np.abs(v - loc)))
+        else:
+            raise ValueError("method must be 'zscore' or 'robust'")
+        out[..., c][brain] = (v - loc) / (scale if scale > 0 else 1.0)
     return out, brain
 
 
-def fit_class_gaussians(pdirs, K: int = 5, ridge: float = 1e-3, verbose: bool = True):
-    """Fit a Gaussian per label (and the label frequencies) from LABELLED training patients.
+def extract_voxels(pdir, norm: str = "zscore", z_stride: int = 1):
+    """All brain voxels of one patient as (Y (n, C) float32, labels (n,) int8), optionally
+    keeping only every z_stride-th slice (to save memory)."""
+    vol, truth, _ = load_patient(pdir)
+    vol, brain = normalise_volume(vol, norm)
+    sel = brain[::z_stride]
+    return vol[::z_stride][sel], truth[::z_stride][sel].astype(np.int8)
 
-    Uses running sums, so only one patient is in memory at a time.
-    Returns mu (K, C), Sigma (K, C, C) and pi (K,).  Test patients must NOT be in `pdirs`.
+
+def fit_models(voxel_sets, K: int = 5, healthy_components: int = 1, ridge: float = 1e-3,
+               max_healthy: int = 300_000, seed: int = 0):
+    """Fit the class-conditional intensity models from LABELLED training voxels.
+
+    voxel_sets: list of (Y (n, C), labels (n,)) from the training patients only.
+    Every tumour label gets one Gaussian.  Label 0 (healthy tissue) gets a mixture of
+    `healthy_components` Gaussians (grey matter, white matter, CSF, ... are different
+    intensity populations); with 1 component this is the plain single-Gaussian model.
+
+    Returns  models: list of K tuples (weights (M,), means (M, C), covariances (M, C, C))
+             pi:     (K,) label frequencies in the brain (the class prior).
     """
-    n = s = S = None
-    for pdir in pdirs:
-        vol, truth, _ = load_patient(pdir)
-        vol, brain = normalise_volume(vol)
-        C = vol.shape[-1]
-        if n is None:
-            n, s, S = np.zeros(K), np.zeros((K, C)), np.zeros((K, C, C))
+    rng = np.random.default_rng(seed)
+    C = voxel_sets[0][0].shape[1]
+    n = np.zeros(K)
+    parts = [[] for _ in range(K)]
+    per_set = max(1, max_healthy // len(voxel_sets))
+    for Y, t in voxel_sets:
         for k in range(K):
-            Yk = vol[brain & (truth == k)].astype(np.float64)
+            Yk = Y[t == k]
             n[k] += len(Yk)
-            s[k] += Yk.sum(axis=0)
-            S[k] += Yk.T @ Yk
-        if verbose:
-            print(f"  fitted from {pdir.name}")
+            if k == 0 and len(Yk) > per_set:
+                Yk = Yk[rng.choice(len(Yk), per_set, replace=False)]
+            parts[k].append(Yk.astype(np.float64))
     if np.any(n == 0):
         raise ValueError(f"labels {np.flatnonzero(n == 0).tolist()} never occur in the training patients")
-    mu = s / n[:, None]
-    Sigma = S / n[:, None, None] - mu[:, :, None] * mu[:, None, :] + ridge * np.eye(mu.shape[1])
-    return mu, Sigma, n / n.sum()
+    models = []
+    for k in range(K):
+        Yk = np.concatenate(parts[k])
+        if k == 0 and healthy_components > 1:
+            gm = GaussianMixture(healthy_components, covariance_type="full", reg_covar=ridge,
+                                 random_state=seed, max_iter=200).fit(Yk)
+            models.append((gm.weights_, gm.means_, gm.covariances_))
+        else:
+            mu = Yk.mean(axis=0)
+            Sigma = np.cov(Yk, rowvar=False) + ridge * np.eye(C)
+            models.append((np.ones(1), mu[None, :], Sigma[None, :, :]))
+    return models, n / n.sum()
 
 
-def loglik_image(Y: np.ndarray, mask: np.ndarray, mu, Sigma, pi) -> np.ndarray:
-    """Per-pixel, per-label log( pi_k * N(y; mu_k, Sigma_k) ), shape (K, H, W), float32.
+def fit_class_models(pdirs, norm: str = "zscore", K: int = 5, healthy_components: int = 1,
+                     z_stride: int = 2, verbose: bool = True):
+    """Convenience: read the training patients and fit_models().  Test patients must NOT be here."""
+    sets = []
+    for pdir in pdirs:
+        sets.append(extract_voxels(pdir, norm, z_stride))
+        if verbose:
+            print(f"  read {pdir.name}")
+    return fit_models(sets, K=K, healthy_components=healthy_components)
 
-    Y is (H, W, C); pixels outside `mask` get 0 (never used).
+
+def loglik_points(Ym: np.ndarray, models, pi, prior_power: float = 1.0) -> np.ndarray:
+    """log( pi_k^prior_power * p(y | label k) ) for every point, shape (K, n), float32.
+
+    p(y | k) = sum_m w_m N(y; mu_m, Sigma_m)  (a single Gaussian when M = 1).
+    prior_power = 1 is the Bayes-consistent choice; < 1 weakens the class prior (a tempering
+    heuristic, only to be chosen on validation patients).
     """
-    K, C = mu.shape
+    K = len(models)
+    C = Ym.shape[1]
+    out = np.zeros((K, len(Ym)), dtype=np.float32)
+    Ym = Ym.astype(np.float64)
+    for k, (w, mu, Sigma) in enumerate(models):
+        comps = []
+        for m in range(len(w)):
+            L = np.linalg.cholesky(Sigma[m])
+            z = solve_triangular(L, (Ym - mu[m]).T, lower=True)
+            logdet = 2.0 * np.log(np.diag(L)).sum()
+            comps.append(np.log(w[m]) - 0.5 * ((z ** 2).sum(axis=0) + logdet + C * np.log(2 * np.pi)))
+        out[k] = (logsumexp(np.stack(comps), axis=0) + prior_power * np.log(pi[k])).astype(np.float32)
+    return out
+
+
+def loglik_image(Y: np.ndarray, mask: np.ndarray, models, pi, prior_power: float = 1.0) -> np.ndarray:
+    """Per-pixel, per-label log-likelihoods (with class prior) of a slice, shape (K, H, W).
+
+    Y is (H, W, C); pixels outside `mask` get 0 (never used)."""
+    K = len(models)
     H, W = mask.shape
     ll = np.zeros((K, H, W), dtype=np.float32)
-    Ym = Y[mask].astype(np.float64)
-    for k in range(K):
-        L = np.linalg.cholesky(Sigma[k])
-        z = solve_triangular(L, (Ym - mu[k]).T, lower=True)
-        logdet = 2.0 * np.log(np.diag(L)).sum()
-        ll[k][mask] = (-0.5 * ((z ** 2).sum(axis=0) + logdet + C * np.log(2 * np.pi))
-                       + np.log(pi[k])).astype(np.float32)
+    ll[:, mask] = loglik_points(Y[mask], models, pi, prior_power)
     return ll
 
 

@@ -5,7 +5,8 @@
     python experiments/run_slice.py HG 0001 --beta 0            # no spatial prior (baseline only)
 
 What it does
-  1. Fits a Gaussian per label (and the label frequencies) on OTHER, labelled patients.
+  1. Fits the class intensity models (a Gaussian per tumour label, a mixture for healthy tissue)
+     and the label frequencies on OTHER, labelled patients.
   2. Builds the per-pixel log-likelihoods for the test slice.
   3. Baseline: beta = 0, i.e. each pixel on its own (exact softmax marginals, no sampling).
   4. Gibbs sampling of the Potts-MRF posterior from several over-dispersed starts.
@@ -29,7 +30,7 @@ from src.config import patient_dir
 from src.data_io import best_slice, list_patients, load_patient, region_masks
 from src.diagnostics import effective_sample_size, split_rhat
 from src.metrics import dice, entropy, error_vs_entropy
-from src.mrf2d import (DEFAULT_REGIONS, fit_class_gaussians, loglik_image, normalise_volume,
+from src.mrf2d import (DEFAULT_REGIONS, fit_class_models, loglik_image, normalise_volume,
                        run_gibbs, softmax_marginals)
 
 K = 5
@@ -43,22 +44,28 @@ def region_dice(pred_labels, truth, mask):
     return out
 
 
-def get_params(grade, test_pid, n_train, refit, cache_dir):
-    """Class Gaussians fitted on other patients of the same grade (cached on disk)."""
+def get_params(grade, test_pid, n_train, norm, M, refit, cache_dir):
+    """Class models fitted on other patients of the same grade (cached on disk as .npz)."""
     ids = [p for p in list_patients(grade) if p != test_pid][:n_train]
-    cache = cache_dir / f"gauss_{grade}_{len(ids)}_excl{test_pid}.npz"
+    cache = cache_dir / f"models_{grade}_{norm}_M{M}_n{len(ids)}_excl{test_pid}.npz"
     if cache.exists() and not refit:
         d = np.load(cache)
         if list(d["ids"]) == ids:
-            print(f"using cached class parameters ({cache.name})")
-            return d["mu"], d["Sigma"], d["pi"], ids
-    print(f"fitting class Gaussians on {len(ids)} patients: {ids}")
+            print(f"using cached class models ({cache.name})")
+            models = [(d[f"w{k}"], d[f"mu{k}"], d[f"S{k}"]) for k in range(K)]
+            return models, d["pi"], ids
+    print(f"fitting class models ({norm} normalisation, healthy mixture M={M}) on "
+          f"{len(ids)} patients: {ids}")
     t = time.time()
-    mu, Sigma, pi = fit_class_gaussians([patient_dir(grade, p) for p in ids], K=K)
+    models, pi = fit_class_models([patient_dir(grade, p) for p in ids], norm=norm, K=K,
+                                  healthy_components=M)
     print(f"  done in {time.time() - t:.0f}s")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(cache, mu=mu, Sigma=Sigma, pi=pi, ids=np.array(ids))
-    return mu, Sigma, pi, ids
+    arrays = {"pi": pi, "ids": np.array(ids)}
+    for k, (w, mu, S) in enumerate(models):
+        arrays.update({f"w{k}": w, f"mu{k}": mu, f"S{k}": S})
+    np.savez(cache, **arrays)
+    return models, pi, ids
 
 
 def main():
@@ -68,6 +75,11 @@ def main():
     ap.add_argument("--z", type=int, default=None, help="slice (default: largest tumour)")
     ap.add_argument("--beta", type=float, default=0.7, help="Potts smoothness (K=5 critical value ~1.17)")
     ap.add_argument("--n-train", type=int, default=10)
+    ap.add_argument("--norm", choices=["zscore", "robust"], default="zscore")
+    ap.add_argument("--healthy-components", type=int, default=1,
+                    help="Gaussians for the healthy class (see experiments/eval_classifier.py)")
+    ap.add_argument("--prior-power", type=float, default=1.0,
+                    help="class prior strength: 1 = Bayes-consistent, <1 weaker")
     ap.add_argument("--chains", type=int, default=4)
     ap.add_argument("--burn", type=int, default=100)
     ap.add_argument("--samples", type=int, default=200)
@@ -85,19 +97,19 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     # ---- 1. class parameters from other patients ---------------------------
-    mu, Sigma, pi, train_ids = get_params(args.grade, args.pid, args.n_train, args.refit,
-                                          root / "results")
+    models, pi, train_ids = get_params(args.grade, args.pid, args.n_train, args.norm,
+                                       args.healthy_components, args.refit, root / "results")
     print("label frequencies in the brain (0=healthy 1=necrosis 2=edema 3=non-enh 4=enhancing):",
           np.round(pi, 4).tolist())
 
     # ---- 2. test slice ------------------------------------------------------
     vol, truth, _ = load_patient(patient_dir(args.grade, args.pid))
-    vol, brain3 = normalise_volume(vol)
+    vol, brain3 = normalise_volume(vol, args.norm)
     z = args.z if args.z is not None else best_slice(truth > 0)
     Y, mask, truth_z = vol[z], brain3[z], truth[z]
     print(f"test patient {args.grade}/{args.pid}, slice {z}: {int(mask.sum())} brain pixels, "
           f"{int((truth_z > 0).sum())} tumour pixels")
-    ll = loglik_image(Y, mask, mu, Sigma, pi)
+    ll = loglik_image(Y, mask, models, pi, args.prior_power)
 
     # ---- 3. baseline: no spatial prior -------------------------------------
     q0 = softmax_marginals(ll, mask)
@@ -124,7 +136,7 @@ def main():
         print(f"{name:>10} {d0[name]:>18.3f} {d1[name]:>10.3f}")
 
     if out is not None:
-        print("\nconvergence (area traces, 4 chains from different starts)")
+        print(f"\nconvergence (area traces, {args.chains} chains from different starts)")
         print(f"{'region':>10} {'split R-hat':>12} {'ESS':>8} {'area mean':>10} {'95% interval':>16} {'truth':>7}")
         for name, labs in DEFAULT_REGIONS.items():
             a = out["areas"][name]
@@ -173,7 +185,8 @@ def main():
     print("\nsaved", path)
     print("\nCaveats: (1) this slice was picked for its large tumour, so it is an optimistic test;"
           "\n         (2) choose beta on validation patients, not on the one you report;"
-          "\n         (3) one Gaussian per label is crude for healthy tissue (grey/white matter/CSF).")
+          "\n         (3) with --healthy-components 1 the healthy class is one Gaussian, which is "
+          "crude for a mix of grey matter, white matter and CSF.")
     if args.show:
         plt.show()
 
