@@ -1,7 +1,7 @@
-"""Stage 2: Bayesian MRF segmentation of ONE slice of a held-out BRATS patient.
+"""Bayesian MRF segmentation of ONE slice of a held-out BRATS patient (a look at the model).
 
-    python experiments/run_slice.py HG 0001
-    python experiments/run_slice.py HG 0001 --beta 0.7 --n-train 10 --chains 4 --burn 100 --samples 200
+    python experiments/run_slice.py HG 0001 --norm robust --healthy-components 4
+    python experiments/run_slice.py HG 0001 --beta 0.7 --chains 4 --burn 100 --samples 200
     python experiments/run_slice.py HG 0001 --beta 0            # no spatial prior (baseline only)
 
 What it does
@@ -10,13 +10,15 @@ What it does
   2. Builds the per-pixel log-likelihoods for the test slice.
   3. Baseline: beta = 0, i.e. each pixel on its own (exact softmax marginals, no sampling).
   4. Gibbs sampling of the Potts-MRF posterior from several over-dispersed starts.
-  5. Posterior marginals -> MPM segmentation (most probable label per pixel), entropy map.
-  6. Reports Dice (whole / core / enhancing) for baseline vs MRF, convergence diagnostics
-     (split R-hat, effective sample size), credible interval of the tumour area, and the
-     error rate per entropy bin (is the uncertainty informative?).
+  5. Two decision rules on the posterior marginals, both reported:
+       argmax : each pixel gets its single most probable label
+       region : each nested region (whole / core / enhancing) is decided by P(region) > 0.5
+  6. Dice and precision/recall, convergence diagnostics (split R-hat, effective sample size),
+     the credible interval of the tumour area, and the error rate of the whole-tumour decision
+     per uncertainty bin (is the uncertainty informative?).
 
-Caveats printed at the end: one slice chosen for its large tumour is an optimistic test; and
-choose beta on validation patients, never on the patient you report.
+This is a qualitative look at one patient.  To compare settings or choose beta, use
+experiments/eval_classifier.py and experiments/eval_beta.py (validation / test split).
 """
 import argparse
 import sys
@@ -27,21 +29,32 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.config import patient_dir
-from src.data_io import best_slice, list_patients, load_patient, region_masks
+from src.data_io import best_slice, list_patients, load_patient
 from src.diagnostics import effective_sample_size, split_rhat
-from src.metrics import dice, entropy, error_vs_entropy
+from src.metrics import dice, entropy, error_vs_entropy, precision_recall
 from src.mrf2d import (DEFAULT_REGIONS, fit_class_models, loglik_image, normalise_volume,
-                       run_gibbs, softmax_marginals)
+                       region_predictions, region_probabilities, run_gibbs, softmax_marginals)
 
 K = 5
 
 
-def region_dice(pred_labels, truth, mask):
-    """Dice of the nested BRATS regions between a predicted and the expert label image."""
-    out = {}
-    for name, labs in DEFAULT_REGIONS.items():
-        out[name] = dice(np.isin(pred_labels, labs) & mask, np.isin(truth, labs) & mask)
-    return out
+def truth_regions(truth_z, mask):
+    return {n: np.isin(truth_z, labs) & mask for n, labs in DEFAULT_REGIONS.items()}
+
+
+def dice_by_rule(q, truth_z, mask):
+    """Dice per nested region under the argmax rule and under the region-wise rule."""
+    tr = truth_regions(truth_z, mask)
+    lab = np.where(mask, q.argmax(axis=0), -1)
+    arg = {n: dice(np.isin(lab, labs) & mask, tr[n]) for n, labs in DEFAULT_REGIONS.items()}
+    preds = region_predictions(q, mask)
+    reg = {n: dice(preds[n], tr[n]) for n in DEFAULT_REGIONS}
+    return arg, reg, preds
+
+
+def nested_levels(regions):
+    """0 = healthy, 1 = whole only, 2 = core, 3 = enhancing (regions are nested)."""
+    return sum(regions[n].astype(int) for n in ("whole", "core", "enhancing"))
 
 
 def get_params(grade, test_pid, n_train, norm, M, refit, cache_dir):
@@ -84,7 +97,7 @@ def main():
     ap.add_argument("--burn", type=int, default=100)
     ap.add_argument("--samples", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--refit", action="store_true", help="ignore the cached class parameters")
+    ap.add_argument("--refit", action="store_true", help="ignore the cached class models")
     ap.add_argument("--show", action="store_true")
     args = ap.parse_args()
 
@@ -96,7 +109,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     rng = np.random.default_rng(args.seed)
 
-    # ---- 1. class parameters from other patients ---------------------------
+    # ---- 1. class models from other patients --------------------------------
     models, pi, train_ids = get_params(args.grade, args.pid, args.n_train, args.norm,
                                        args.healthy_components, args.refit, root / "results")
     print("label frequencies in the brain (0=healthy 1=necrosis 2=edema 3=non-enh 4=enhancing):",
@@ -107,14 +120,14 @@ def main():
     vol, brain3 = normalise_volume(vol, args.norm)
     z = args.z if args.z is not None else best_slice(truth > 0)
     Y, mask, truth_z = vol[z], brain3[z], truth[z]
+    tr = truth_regions(truth_z, mask)
     print(f"test patient {args.grade}/{args.pid}, slice {z}: {int(mask.sum())} brain pixels, "
-          f"{int((truth_z > 0).sum())} tumour pixels")
+          f"{int(tr['whole'].sum())} tumour pixels")
     ll = loglik_image(Y, mask, models, pi, args.prior_power)
 
     # ---- 3. baseline: no spatial prior -------------------------------------
     q0 = softmax_marginals(ll, mask)
-    lab0 = np.where(mask, q0.argmax(axis=0), -1)
-    d0 = region_dice(lab0, truth_z, mask)
+    arg0, reg0, _ = dice_by_rule(q0, truth_z, mask)
 
     # ---- 4. Gibbs sampling --------------------------------------------------
     if args.beta > 0:
@@ -126,56 +139,65 @@ def main():
         q = out["q"]
     else:
         out, q = None, q0
-    labels = np.where(mask, q.argmax(axis=0), -1)       # MPM: most probable label per pixel
-    d1 = region_dice(labels, truth_z, mask)
+    arg1, reg1, preds = dice_by_rule(q, truth_z, mask)
 
     # ---- 5. report ----------------------------------------------------------
-    print(f"\nDice on slice {z} (beta = {args.beta})")
-    print(f"{'region':>10} {'no prior (beta=0)':>18} {'MRF, MPM':>10}")
-    for name in DEFAULT_REGIONS:
-        print(f"{name:>10} {d0[name]:>18.3f} {d1[name]:>10.3f}")
+    print(f"\nDice on slice {z}")
+    print(f"{'':>10} {'-- beta = 0 --':>22}   {f'-- MRF, beta = {args.beta} --':>24}")
+    print(f"{'region':>10} {'argmax':>10} {'region rule':>11}   {'argmax':>10} {'region rule':>11}")
+    for n in DEFAULT_REGIONS:
+        print(f"{n:>10} {arg0[n]:>10.3f} {reg0[n]:>11.3f}   {arg1[n]:>10.3f} {reg1[n]:>11.3f}")
+    prec, rec = precision_recall(preds["whole"], tr["whole"])
+    print(f"whole tumour (MRF, region rule): precision {prec:.3f}, recall {rec:.3f}   "
+          f"(predicted {int(preds['whole'].sum())} px vs expert {int(tr['whole'].sum())} px)")
+    print("  low recall = tumour is being missed; low precision = healthy tissue labelled tumour")
 
     if out is not None:
         print(f"\nconvergence (area traces, {args.chains} chains from different starts)")
         print(f"{'region':>10} {'split R-hat':>12} {'ESS':>8} {'area mean':>10} {'95% interval':>16} {'truth':>7}")
-        for name, labs in DEFAULT_REGIONS.items():
-            a = out["areas"][name]
+        for n, labs in DEFAULT_REGIONS.items():
+            a = out["areas"][n]
             lo, hi = np.percentile(a, [2.5, 97.5])
-            true_area = int((np.isin(truth_z, labs) & mask).sum())
-            print(f"{name:>10} {split_rhat(a):>12.3f} {effective_sample_size(a):>8.0f} "
-                  f"{a.mean():>10.0f} {f'[{lo:.0f}, {hi:.0f}]':>16} {true_area:>7d}")
+            print(f"{n:>10} {split_rhat(a):>12.3f} {effective_sample_size(a):>8.0f} "
+                  f"{a.mean():>10.0f} {f'[{lo:.0f}, {hi:.0f}]':>16} {int(tr[n].sum()):>7d}")
         print("  (R-hat close to 1, e.g. < 1.05, means the chains agree; ESS is the number of "
-              "independent-equivalent samples out of "
-              f"{args.chains * args.samples})")
+              f"independent-equivalent samples out of {args.chains * args.samples})")
+        print("  The interval is the model's own uncertainty: if the expert area lies far outside it,\n"
+              "  the model is mis-specified (confidently wrong), not merely noisy.")
 
-    print("\nIs the uncertainty informative?  error rate of the MPM label per entropy bin")
+    pw = region_probabilities(q)["whole"]
+    q2 = np.stack([1 - pw, pw])                                   # binary: healthy vs whole tumour
+    print("\nIs the uncertainty informative?  error rate of the whole-tumour decision per entropy bin")
     print(f"{'bin':>4} {'mean entropy':>13} {'error rate':>11} {'pixels':>8}")
-    for i, (h, e, n) in enumerate(error_vs_entropy(q, labels, truth_z, mask), 1):
+    for i, (h, e, n) in enumerate(error_vs_entropy(q2, preds["whole"].astype(int),
+                                                   tr["whole"].astype(int), mask), 1):
         print(f"{i:>4} {h:>13.3f} {e:>11.3f} {n:>8d}")
 
     # ---- 6. figure ----------------------------------------------------------
     fig, ax = plt.subplots(2, 3, figsize=(13, 8.5))
-    show = lambda a, img, title, **kw: (a.imshow(img, **kw), a.set_title(title), a.axis("off"))
     flair = np.where(mask, Y[..., 0], np.nan)
-    show(ax[0, 0], flair, "FLAIR + expert whole-tumour outline", cmap="gray")
-    ax[0, 0].contour(truth_z > 0, levels=[0.5], colors="r", linewidths=0.8)
-    show(ax[0, 1], np.where(mask, truth_z, np.nan), "expert labels", cmap="viridis", vmin=0, vmax=4)
-    show(ax[0, 2], np.where(mask, labels, np.nan), f"MPM labels (beta={args.beta})",
-         cmap="viridis", vmin=0, vmax=4)
-    im = ax[1, 0].imshow(np.where(mask, entropy(q), np.nan), cmap="magma")
-    ax[1, 0].set_title("posterior entropy (uncertainty)"); ax[1, 0].axis("off")
+    ax[0, 0].imshow(flair, cmap="gray"); ax[0, 0].set_title("FLAIR + expert whole-tumour outline")
+    ax[0, 0].contour(tr["whole"], levels=[0.5], colors="r", linewidths=0.8)
+    ax[0, 1].imshow(np.where(mask, nested_levels(tr), np.nan), cmap="viridis", vmin=0, vmax=3)
+    ax[0, 1].set_title("expert nested regions\n(1 whole, 2 core, 3 enhancing)")
+    ax[0, 2].imshow(np.where(mask, nested_levels(preds), np.nan), cmap="viridis", vmin=0, vmax=3)
+    ax[0, 2].set_title(f"predicted nested regions (beta={args.beta}, region rule)")
+    im = ax[1, 0].imshow(np.where(mask, entropy(q2), np.nan), cmap="magma")
+    ax[1, 0].set_title("uncertainty: entropy of P(whole tumour)")
     fig.colorbar(im, ax=ax[1, 0], fraction=0.046)
-    im = ax[1, 1].imshow(np.where(mask, 1 - q[0], np.nan), cmap="hot", vmin=0, vmax=1)
-    ax[1, 1].set_title("P(tumour) = 1 - P(healthy)"); ax[1, 1].axis("off")
+    im = ax[1, 1].imshow(np.where(mask, pw, np.nan), cmap="hot", vmin=0, vmax=1)
+    ax[1, 1].set_title("P(whole tumour)")
     fig.colorbar(im, ax=ax[1, 1], fraction=0.046)
     if out is not None:
-        for c, tr in enumerate(out["areas"]["whole"]):
-            ax[1, 2].plot(tr, lw=0.8, label=f"chain {c}")
-        ax[1, 2].axhline((truth_z > 0)[mask].sum(), color="k", ls="--", label="expert")
+        for c, trace in enumerate(out["areas"]["whole"]):
+            ax[1, 2].plot(trace, lw=0.8, label=f"chain {c}")
+        ax[1, 2].axhline(tr["whole"].sum(), color="k", ls="--", label="expert")
         ax[1, 2].set_title("whole-tumour area per sample"); ax[1, 2].set_xlabel("kept sweep")
         ax[1, 2].legend(fontsize=7)
     else:
         ax[1, 2].axis("off")
+    for a in ax.ravel()[:5]:
+        a.axis("off")
     fig.suptitle(f"{args.grade} {args.pid}, slice {z}")
     fig.tight_layout()
     fdir = root / "results" / "figures"
@@ -184,7 +206,8 @@ def main():
     fig.savefig(path, dpi=130)
     print("\nsaved", path)
     print("\nCaveats: (1) this slice was picked for its large tumour, so it is an optimistic test;"
-          "\n         (2) choose beta on validation patients, not on the one you report;"
+          "\n         (2) do NOT choose beta or the likelihood settings on this patient: use"
+          "\n             experiments/eval_classifier.py and experiments/eval_beta.py;"
           "\n         (3) with --healthy-components 1 the healthy class is one Gaussian, which is "
           "crude for a mix of grey matter, white matter and CSF.")
     if args.show:

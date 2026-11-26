@@ -40,3 +40,15 @@ def error_vs_entropy(q: np.ndarray, labels: np.ndarray, truth: np.ndarray,
     for idx in np.array_split(order, n_bins):
         rows.append((float(h[idx].mean()), float(wrong[idx].mean()), int(len(idx))))
     return rows
+
+
+def precision_recall(pred: np.ndarray, truth: np.ndarray):
+    """(precision, recall) of a predicted mask against the expert mask.
+
+    Dice alone cannot tell *why* it is low: low recall = tumour is being missed,
+    low precision = healthy tissue is being labelled as tumour."""
+    pred, truth = pred.astype(bool), truth.astype(bool)
+    tp = float((pred & truth).sum())
+    precision = tp / pred.sum() if pred.sum() else 1.0
+    recall = tp / truth.sum() if truth.sum() else 1.0
+    return precision, recall

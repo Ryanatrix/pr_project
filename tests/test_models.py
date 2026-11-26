@@ -9,7 +9,7 @@ import numpy as np
 from scipy.stats import multivariate_normal as mvn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.mrf2d import fit_models, loglik_points
+from src.mrf2d import fit_models, loglik_points, region_predictions, region_probabilities
 
 
 def _toy_voxels(rng, n=6000):
@@ -45,6 +45,26 @@ def test_healthy_mixture_classifies_better_than_one_gaussian():
     assert recall[3] > recall[1] + 0.04, recall
 
 
+def test_region_rule_is_nested_and_recovers_split_tumour_mass():
+    # label marginals for 3 pixels, labels 0..4 as rows:  pixel 0 = tumour mass split over three
+    # labels (argmax says healthy, but P(tumour) = 0.70);  pixel 1 = clearly healthy;
+    # pixel 2 = clearly enhancing tumour
+    q = np.array([[0.30, 0.95, 0.02],
+                  [0.25, 0.01, 0.02],
+                  [0.00, 0.02, 0.02],
+                  [0.20, 0.01, 0.02],
+                  [0.25, 0.01, 0.92]])
+    assert q.argmax(axis=0).tolist() == [0, 0, 4]
+    pred = region_predictions(q)
+    assert pred["whole"].tolist() == [True, False, True]        # pixel 0 found by the region rule
+    assert pred["enhancing"].tolist() == [False, False, True]
+    assert not np.any(pred["core"] & ~pred["whole"])            # nested
+    assert not np.any(pred["enhancing"] & ~pred["core"])
+    pr = region_probabilities(q)
+    assert np.allclose(pr["whole"], 1 - q[0])
+
+
 if __name__ == "__main__":
     test_single_gaussian_loglik_matches_scipy();               print("loglik vs scipy               OK")
     test_healthy_mixture_classifies_better_than_one_gaussian(); print("healthy mixture beats 1 Gauss OK")
+    test_region_rule_is_nested_and_recovers_split_tumour_mass(); print("region rule nested/split mass  OK")

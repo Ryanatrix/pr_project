@@ -162,6 +162,29 @@ def softmax_marginals(ll: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return q
 
 
+def region_probabilities(q: np.ndarray, regions=None) -> dict:
+    """Posterior probability of each nested region event, from label marginals q (K, ...).
+
+    P(whole) = P(label in {1,2,3,4}),  P(core) = P(label in {1,3,4}),  P(enhancing) = P(label = 4).
+    Because core is a subset of whole (and enhancing of core), P(core) <= P(whole) etc.
+    """
+    regions = DEFAULT_REGIONS if regions is None else regions
+    return {name: q[list(labs)].sum(axis=0) for name, labs in regions.items()}
+
+
+def region_predictions(q: np.ndarray, mask=None, regions=None, thr: float = 0.5) -> dict:
+    """Region-wise decision: a pixel is in region R when P(R) > thr (0.5 = most probable choice
+    for that yes/no question).  Masks are automatically nested because the probabilities are.
+
+    This differs from taking the single most probable label: when the tumour mass is split
+    between several tumour labels, no single tumour label may beat 'healthy' even though
+    P(tumour) is large."""
+    out = {name: p > thr for name, p in region_probabilities(q, regions).items()}
+    if mask is not None:
+        out = {name: m & mask for name, m in out.items()}
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Gibbs sampling
 # ----------------------------------------------------------------------------
